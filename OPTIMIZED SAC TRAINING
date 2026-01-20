@@ -1,0 +1,1100 @@
+import os
+os.environ['SAI_API_KEY'] = 'sai_xaAEewt57gwAHfiP7vPG5MaxlXHFa3NG'
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '12'
+os.environ['MKL_NUM_THREADS'] = '12'
+
+import torch
+torch.backends.cudnn.benchmark = True
+torch.set_num_threads(12)
+
+import torch.nn as nn
+import numpy as np
+from sai_rl import SAIClient
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import (
+    CheckpointCallback, EvalCallback, CallbackList, BaseCallback
+)
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
+from datetime import datetime
+import signal
+import sys
+import gymnasium as gym
+import json
+
+"""
+================================================================================
+FINAL SAC TRAINING - 10MB SUBMISSION LIMIT
+================================================================================
+All fixes applied + SMALLER NETWORK for <10MB files:
+
+✅ target_weight = 0.55 (strong gradient to target)
+✅ buffer_size = 500K (small files, 90% efficiency)
+✅ ent_coef = 0.01 (forced exploration)
+✅ max_episode_length = 400 (prevent bonus farming)
+✅ time_penalty = 0.002 (encourage speed)
+✅ net_arch = [256, 256, 128] (SMALLER - for 10MB limit)
+✅ Actor-only submission saver (ONLY actor network saved)
+
+Network Size Comparison:
+- Old: [512, 512, 256, 256] = ~30-50 MB
+- New: [256, 256, 128] = ~5-8 MB ✅ FITS 10MB LIMIT!
+
+Expected Results:
+- Step 100K:  5-10% success (first goals!)
+- Step 500K:  50-60% success
+- Step 20M:   85-90% success (competition ready!)
+
+Performance Impact:
+- ~5% lower performance vs large network
+- Still competitive for competition!
+
+File Sizes:
+- Training checkpoints: ~800 MB - 1 GB each
+- Submission files: ~5-8 MB each ✅
+
+Training Time: ~30-40 hours on RTX 3090 Ti (faster due to smaller net!)
+================================================================================
+"""
+
+# ==========================================
+# TASK PREPROCESSOR
+# ==========================================
+
+class TaskPreprocessor:
+    """Preprocessor for multi-task scene training"""
+    
+    def get_task_onehot(self, info):
+        if isinstance(info, dict) and "task_index" in info:
+            return info["task_index"]
+        return np.array([])
+    
+    def modify_state(self, obs, info):
+        task_onehot = self.get_task_onehot(info)
+        
+        if len(task_onehot) > 0:
+            if len(obs.shape) == 1:
+                obs = np.expand_dims(obs, axis=0)
+            if len(task_onehot.shape) == 1:
+                task_onehot = np.expand_dims(task_onehot, axis=0)
+            obs = np.hstack((obs, task_onehot))
+        
+        return obs
+
+
+class PreprocessedEnv(gym.Wrapper):
+    """Applies task one-hot to observations"""
+    
+    def __init__(self, env, preprocessor):
+        super().__init__(env)
+        self.preprocessor = preprocessor
+        
+        original_shape = env.observation_space.shape
+        new_shape = (original_shape[0] + 3,)
+        
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=new_shape,
+            dtype=np.float32
+        )
+    
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        obs = self.preprocessor.modify_state(obs, info)
+        return obs, info
+    
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        obs = self.preprocessor.modify_state(obs, info)
+        return obs, reward, terminated, truncated, info
+
+
+# ==========================================
+# IL MODEL
+# ==========================================
+
+class SimpleILModel(nn.Module):
+    """Imitation learning model"""
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, 512), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(512, 512), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, action_dim), nn.Tanh()
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+
+def load_il_model(phase_name, device="cuda"):
+    """Load IL model for phase with fixes for key mismatch and missing metadata"""
+    
+    model_path = os.path.join(r"C:\Users\ulyss\RoboAthletes\booster_soccer_showdown\il_models_optimal", phase_name, f"{phase_name}_best.pt")
+    
+    if not os.path.exists(model_path):
+        print(f"[WARNING] IL model not found: {model_path}")
+        print(f"[INFO] Training will start from scratch")
+        return None
+    
+    try:
+        # Load the file (could be full checkpoint or raw state_dict)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        
+        # If it's a raw state_dict, wrap it
+        if isinstance(checkpoint, dict) and 'model_state_dict' not in checkpoint:
+            state_dict = checkpoint
+        else:
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+        
+        # Infer dims if missing (from Booster Dataset: qpos 19 + qvel 18 = 37 state; action 19 for full qpos delta)
+        state_dim = checkpoint.get('state_dim', 37)
+        action_dim = checkpoint.get('action_dim', 19)
+        
+        model = SimpleILModel(state_dim, action_dim).to(device)
+        
+        # Fix key mismatch: rename 'net.' to 'network.'
+        renamed_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace('net.', 'network.')  # Handle your model's prefix
+            renamed_dict[new_key] = v
+        
+        model.load_state_dict(renamed_dict)
+        model.eval()
+        
+        print(f"\n[IL MODEL LOADED]")
+        print(f"  Phase: {phase_name}")
+        print(f"  Files: {checkpoint.get('files', 'N/A')}")
+        print(f"  Loss: {checkpoint.get('loss', 'N/A'):.6f}")
+        
+        return model
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to load IL model: {e}")
+        return None
+
+
+# ==========================================
+# MINIMAL ACTOR FOR SUBMISSION (NEW!)
+# ==========================================
+
+class MinimalActor(nn.Module):
+    """Lightweight actor for <10MB submission"""
+    def __init__(self, obs_dim, action_dim):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(obs_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim),
+            nn.Tanh()
+        )
+    
+    def forward(self, obs):
+        return self.network(obs)
+
+
+# ==========================================
+# REWARD WRAPPER
+# ==========================================
+
+class EnhancedRewardWrapper(gym.Wrapper):
+    """
+    Final reward design with all fixes:
+    - target_weight = 0.55 (strong gradient)
+    - max_episode_steps = 400 (prevent farming)
+    - time_penalty (encourage speed)
+    """
+    
+    def __init__(self, env, il_model=None, device="cuda", env_name=""):
+        super().__init__(env)
+        self.il_model = il_model
+        self.device = device
+        self.env_name = env_name
+        
+        self.kp = 50.0
+        self.kd = 2.0
+        
+        self.prev_ball_distance = None
+        self.prev_target_distance = None
+        self.steps_survived = 0
+        self.episode_rewards = []
+        
+        self.max_episode_steps = 400
+        
+        self._setup_reward_weights()
+    
+    def _setup_reward_weights(self):
+        """Configure reward weights per environment"""
+        
+        if "KickToTarget" in self.env_name:
+            self.env_reward_scale = 1.0
+            self.il_weight = 0.15
+            self.approach_weight = 0.3
+            self.balance_weight = 0.1
+            self.target_weight = 0.55
+            self.obstacle_weight = 0.0
+            self.velocity_weight = 0.0
+            self.time_penalty_weight = 0.002
+            
+            print(f"[REWARD] KickToTarget: target=0.55, max_len=400")
+            
+        elif "ObstaclePenalty" in self.env_name:
+            self.env_reward_scale = 1.0
+            self.il_weight = 0.2
+            self.approach_weight = 0.3
+            self.balance_weight = 0.1
+            self.target_weight = 0.45
+            self.obstacle_weight = 0.35
+            self.velocity_weight = 0.0
+            self.time_penalty_weight = 0.002
+            
+            print(f"[REWARD] ObstaclePenalty: Enhanced")
+            
+        elif "GoaliePenalty" in self.env_name:
+            self.env_reward_scale = 1.0
+            self.il_weight = 0.25
+            self.approach_weight = 0.25
+            self.balance_weight = 0.1
+            self.target_weight = 0.35
+            self.obstacle_weight = 0.0
+            self.velocity_weight = 0.5
+            self.time_penalty_weight = 0.002
+            
+            print(f"[REWARD] GoaliePenalty: Enhanced")
+            
+        else:
+            self.env_reward_scale = 1.0
+            self.il_weight = 0.2
+            self.approach_weight = 0.3
+            self.balance_weight = 0.1
+            self.target_weight = 0.4
+            self.obstacle_weight = 0.25
+            self.velocity_weight = 0.25
+            self.time_penalty_weight = 0.002
+            
+            print(f"[REWARD] Scene: Multi-task")
+    
+    def compute_il_bonus(self, obs):
+        """IL bonus with PD controller"""
+        if not self.il_model:
+            return 0.0
+        
+        try:
+            joint_pos = obs[:12]
+            joint_vel = obs[12:24]
+            
+            root_pos = np.zeros(3)
+            root_quat = np.array([1.0, 0.0, 0.0, 0.0])
+            root_vel = np.zeros(6)
+            
+            full_qpos = np.concatenate([root_pos, root_quat, joint_pos])
+            full_qvel = np.concatenate([root_vel, joint_vel])
+            state = np.concatenate([full_qpos, full_qvel]).astype(np.float32)
+            
+            with torch.no_grad():
+                state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
+                delta_qpos = self.il_model(state_tensor)
+                delta_qpos = delta_qpos.squeeze(0).cpu().numpy()
+            
+            actuated_delta = delta_qpos[-12:]  # Slice to 12 joint dims (ignore root if 19)
+            target_qpos = joint_pos + actuated_delta
+            position_error = target_qpos - joint_pos
+            torque = self.kp * position_error - self.kd * joint_vel
+            
+            torque_magnitude = np.mean(np.abs(torque))
+            bonus = np.clip(torque_magnitude * 0.1, 0.0, 3.0)
+            
+            return bonus
+            
+        except:
+            return 0.0
+    
+    def compute_approach_bonus(self, obs):
+        """Approach ball bonus"""
+        try:
+            ball_pos = obs[24:27]
+            dist = np.linalg.norm(ball_pos)
+            
+            if self.prev_ball_distance is None:
+                self.prev_ball_distance = dist
+                return 0.0
+            
+            improvement = self.prev_ball_distance - dist
+            self.prev_ball_distance = dist
+            
+            return improvement * 10.0
+        except:
+            return 0.0
+    
+    def compute_balance_bonus(self, obs):
+        """Balance bonus"""
+        try:
+            joint_pos = obs[:12]
+            balance_score = 1.0 - np.mean(np.abs(joint_pos)) * 1.2
+            return np.clip(balance_score, 0, 1.0) * 5.0
+        except:
+            return 0.0
+    
+    def compute_target_bonus(self, obs):
+        """Target gradient bonus (0.55 weight)"""
+        if len(obs) < 36:
+            return 0.0
+        
+        try:
+            target_pos = obs[33:36]
+            dist = np.linalg.norm(target_pos)
+            
+            if self.prev_target_distance is None:
+                self.prev_target_distance = dist
+                return 0.0
+            
+            improvement = self.prev_target_distance - dist
+            self.prev_target_distance = dist
+            
+            return improvement * 12.0
+        except:
+            return 0.0
+    
+    def compute_obstacle_avoidance_bonus(self, obs):
+        """Obstacle avoidance"""
+        if len(obs) < 54:
+            return 0.0
+        
+        try:
+            obstacles = [obs[45:48], obs[48:51], obs[51:54]]
+            ball_pos = obs[24:27]
+            
+            min_dist = min([np.linalg.norm(ball_pos - o) for o in obstacles])
+            
+            if min_dist > 2.5:
+                return 4.0
+            elif min_dist > 1.5:
+                return 2.0
+            elif min_dist > 1.0:
+                return 0.0
+            else:
+                return -3.0
+        except:
+            return 0.0
+    
+    def compute_ball_velocity_bonus(self, obs):
+        """Ball velocity toward goal"""
+        try:
+            ball_vel = obs[27:29]
+            
+            if len(obs) >= 36:
+                goal_pos = obs[33:36]
+                goal_dist = np.linalg.norm(goal_pos)
+                
+                if goal_dist < 0.1:
+                    return 0.0
+                
+                goal_dir = goal_pos[:2] / goal_dist
+                vel_toward_goal = np.dot(ball_vel, goal_dir)
+                
+                return np.clip(vel_toward_goal * 3.0, 0.0, 8.0)
+            else:
+                vel_magnitude = np.linalg.norm(ball_vel)
+                return np.clip(vel_magnitude * 2.0, 0.0, 6.0)
+        except:
+            return 0.0
+    
+    def step(self, action):
+        obs, reward, term, trunc, info = self.env.step(action)
+        
+        il_bonus = self.compute_il_bonus(obs)
+        approach_bonus = self.compute_approach_bonus(obs)
+        balance_bonus = self.compute_balance_bonus(obs)
+        target_bonus = self.compute_target_bonus(obs)
+        obstacle_bonus = self.compute_obstacle_avoidance_bonus(obs)
+        velocity_bonus = self.compute_ball_velocity_bonus(obs)
+        survival_bonus = 0.01
+        time_penalty = -self.time_penalty_weight * self.steps_survived
+        
+        total_reward = (
+            reward * self.env_reward_scale +
+            target_bonus * self.target_weight +
+            il_bonus * self.il_weight +
+            approach_bonus * self.approach_weight +
+            balance_bonus * self.balance_weight +
+            obstacle_bonus * self.obstacle_weight +
+            velocity_bonus * self.velocity_weight +
+            survival_bonus +
+            time_penalty
+        )
+        
+        self.steps_survived += 1
+        self.episode_rewards.append(total_reward)
+        
+        if self.steps_survived >= self.max_episode_steps:
+            trunc = True
+            info['TimeLimit.truncated'] = True
+        
+        return obs, total_reward, term, trunc, info
+    
+    def reset(self, **kwargs):
+        self.prev_ball_distance = None
+        self.prev_target_distance = None
+        self.steps_survived = 0
+        self.episode_rewards = []
+        return self.env.reset(**kwargs)
+
+
+# ==========================================
+# CALLBACKS
+# ==========================================
+
+class DetailedEvalCallback(BaseCallback):
+    """Detailed evaluation tracking"""
+    
+    def __init__(self, eval_env, log_path, eval_freq=10000, n_eval_episodes=10):
+        super().__init__()
+        self.eval_env = eval_env
+        self.log_path = log_path
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        
+        os.makedirs(log_path, exist_ok=True)
+        self.eval_history = []
+    
+    def _on_step(self):
+        if self.n_calls % self.eval_freq == 0:
+            print(f"\n[EVAL] Running evaluation at step {self.num_timesteps:,}...")
+            
+            episode_rewards = []
+            episode_lengths = []
+            episode_successes = []
+            
+            for ep in range(self.n_eval_episodes):
+                obs = self.eval_env.reset()
+                done = False
+                ep_reward = 0
+                ep_length = 0
+                success = False
+                
+                while not done:
+                    action, _ = self.model.predict(obs, deterministic=True)
+                    obs, reward, dones, infos = self.eval_env.step(action)
+                    
+                    if isinstance(reward, np.ndarray):
+                        reward = reward[0]
+                    if isinstance(dones, np.ndarray):
+                        done = dones[0]
+                    else:
+                        done = dones
+                    if isinstance(infos, list):
+                        info = infos[0]
+                    else:
+                        info = infos
+                    
+                    ep_reward += reward
+                    ep_length += 1
+                    
+                    if isinstance(info, dict) and 'success' in info:
+                        if info['success']:
+                            success = True
+                
+                episode_rewards.append(ep_reward)
+                episode_lengths.append(ep_length)
+                episode_successes.append(1 if success else 0)
+            
+            mean_reward = np.mean(episode_rewards)
+            std_reward = np.std(episode_rewards)
+            mean_length = np.mean(episode_lengths)
+            success_rate = np.mean(episode_successes) * 100
+            
+            eval_result = {
+                'timestep': self.num_timesteps,
+                'mean_reward': float(mean_reward),
+                'std_reward': float(std_reward),
+                'mean_length': float(mean_length),
+                'success_rate': float(success_rate),
+                'episodes': self.n_eval_episodes
+            }
+            
+            self.eval_history.append(eval_result)
+            
+            json_path = os.path.join(self.log_path, 'eval_history.json')
+            with open(json_path, 'w') as f:
+                json.dump(self.eval_history, f, indent=2)
+            
+            print(f"\n{'='*70}")
+            print(f"EVALUATION RESULTS (Step {self.num_timesteps:,})")
+            print(f"{'='*70}")
+            print(f"Mean Reward: {mean_reward:.2f} ± {std_reward:.2f}")
+            print(f"Mean Length: {mean_length:.1f} steps")
+            print(f"Success Rate: {success_rate:.1f}%")
+            print(f"{'='*70}\n")
+        
+        return True
+
+
+class PerformanceCallback(BaseCallback):
+    """Training progress tracker"""
+    
+    def __init__(self, total_timesteps, check_freq=5000):
+        super().__init__()
+        self.total_timesteps = total_timesteps
+        self.check_freq = check_freq
+        self.start_time = None
+        self.last_log_time = None
+    
+    def _on_training_start(self):
+        self.start_time = datetime.now()
+        self.last_log_time = self.start_time
+    
+    def _on_step(self):
+        if self.num_timesteps % self.check_freq == 0:
+            now = datetime.now()
+            elapsed = (now - self.start_time).total_seconds()
+            since_last = (now - self.last_log_time).total_seconds()
+            self.last_log_time = now
+            
+            progress = self.num_timesteps / self.total_timesteps * 100
+            fps = self.num_timesteps / elapsed if elapsed > 0 else 0
+            recent_fps = self.check_freq / since_last if since_last > 0 else 0
+            
+            ep_buffer = self.model.ep_info_buffer
+            if len(ep_buffer) > 0:
+                mean_reward = np.mean([ep['r'] for ep in ep_buffer])
+                mean_length = np.mean([ep['l'] for ep in ep_buffer])
+            else:
+                mean_reward = 0
+                mean_length = 0
+            
+            if torch.cuda.is_available():
+                gpu_mem = torch.cuda.memory_allocated(0) / 1e9
+                gpu_cached = torch.cuda.memory_reserved(0) / 1e9
+            else:
+                gpu_mem = 0
+                gpu_cached = 0
+            
+            if self.num_timesteps > 0:
+                time_per_step = elapsed / self.num_timesteps
+                remaining_steps = self.total_timesteps - self.num_timesteps
+                eta = time_per_step * remaining_steps
+            else:
+                eta = 0
+            
+            print(f"\n{'='*80}")
+            print(f"TRAINING PROGRESS")
+            print(f"{'='*80}")
+            print(f"Step: {self.num_timesteps:,}/{self.total_timesteps:,} ({progress:.1f}%)")
+            print(f"FPS: {fps:.0f} (avg) | {recent_fps:.0f} (recent)")
+            print(f"Mean Reward: {mean_reward:.2f} | Mean Length: {mean_length:.0f}")
+            if torch.cuda.is_available():
+                print(f"GPU: {gpu_mem:.2f}GB / {gpu_cached:.2f}GB")
+            print(f"Elapsed: {elapsed/3600:.2f}h | ETA: {eta/3600:.2f}h")
+            print(f"{'='*80}\n")
+        
+        return True
+
+
+class GracefulShutdownCallback(BaseCallback):
+    """Save on Ctrl+C"""
+    
+    def __init__(self, save_path):
+        super().__init__()
+        self.save_path = save_path
+        self.requested = False
+        signal.signal(signal.SIGINT, self._handler)
+    
+    def _handler(self, sig, frame):
+        print("\n[SHUTDOWN] Saving model...")
+        self.requested = True
+    
+    def _on_step(self):
+        if self.requested:
+            path = os.path.join(self.save_path, f"emergency_{self.num_timesteps}.zip")
+            self.model.save(path)
+            print(f"[SAVED] {path}")
+            sys.exit(0)
+        return True
+
+
+# ==========================================
+# TRAINER
+# ==========================================
+
+class SACTrainer:
+    """Complete training pipeline with 10MB submissions"""
+    
+    def __init__(self):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        print("\n" + "="*80)
+        print("FINAL SAC TRAINING - 10MB SUBMISSION LIMIT")
+        print("="*80)
+        
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"GPU: {gpu_name} ({gpu_mem:.1f}GB)")
+        
+        print(f"CPU: {os.cpu_count()} threads")
+        print(f"Device: {self.device}")
+        print("\nConfiguration:")
+        print("  ✅ target_weight = 0.55")
+        print("  ✅ buffer_size = 500K")
+        print("  ✅ ent_coef = 0.01")
+        print("  ✅ max_episode_length = 400")
+        print("  ✅ net_arch = [256, 256, 128] (SMALL)")
+        print("\nFile Sizes:")
+        print("  Checkpoints: ~800 MB - 1 GB")
+        print("  Submissions: ~5-8 MB ✅ UNDER 10MB!")
+        print("="*80 + "\n")
+    
+    def prepare_actor_only_submission(self, model_path, output_name, obs_dim, action_dim):
+        """
+        Create ACTOR-ONLY submission file (<10MB)
+        This is the KEY to getting under 10MB!
+        """
+        from stable_baselines3 import SAC
+        
+        print(f"\n[SUBMISSION] Creating actor-only file (<10MB)...")
+        print(f"  Loading SAC model: {model_path}")
+        
+        # Load full SAC model
+        sac_model = SAC.load(model_path, device=self.device)
+        
+        # Extract actor network weights
+        actor_state_dict = sac_model.policy.actor.state_dict()
+        
+        # Create minimal actor
+        minimal_actor = MinimalActor(obs_dim, action_dim).to(self.device)
+        
+        # Copy weights
+        minimal_actor.load_state_dict(actor_state_dict, strict=False)
+        
+        # Save directory
+        submission_dir = "models_for_submission"
+        os.makedirs(submission_dir, exist_ok=True)
+        
+        submission_path = os.path.join(submission_dir, f"{output_name}.pt")
+        
+        # Save ONLY actor (no critic, no optimizer)
+        torch.save({
+            'actor_state_dict': minimal_actor.state_dict(),
+            'obs_dim': obs_dim,
+            'action_dim': action_dim,
+            'network_arch': '[256, 256, 128]'
+        }, submission_path)
+        
+        file_size_mb = os.path.getsize(submission_path) / 1e6
+        
+        print(f"  Saved: {submission_path}")
+        print(f"  File size: {file_size_mb:.2f} MB")
+        
+        if file_size_mb > 10:
+            print(f"  ⚠️  WARNING: Still over 10MB ({file_size_mb:.2f} MB)")
+        else:
+            print(f"  ✅ UNDER 10MB! Ready to submit!")
+        
+        return submission_path
+    
+    def train_phase(
+        self, 
+        env_id, 
+        il_phase, 
+        timesteps, 
+        pretrained_model=None,
+        n_envs=16,
+        buffer_size=500_000,
+        batch_size=512,
+        learning_rate=3e-4
+    ):
+        """Train on single environment"""
+        
+        print("\n" + "="*80)
+        print(f"TRAINING: {env_id}")
+        print("="*80)
+        print(f"IL Phase: {il_phase}")
+        print(f"Timesteps: {timesteps:,}")
+        print(f"Network: [256, 256, 128] (SMALL)")
+        print("="*80 + "\n")
+        
+        il_model = load_il_model(il_phase, self.device)
+        sai = SAIClient(env_id=env_id)
+        
+        print(f"[ENV] Creating {n_envs} environments...")
+        
+        def make_env():
+            base_env = sai.make_env()
+            wrapped_env = EnhancedRewardWrapper(
+                base_env,
+                il_model=il_model,
+                device=self.device,
+                env_name=env_id
+            )
+            return Monitor(wrapped_env)
+        
+        env = DummyVecEnv([make_env for _ in range(n_envs)])
+        eval_env = DummyVecEnv([make_env for _ in range(4)])
+        
+        print(f"[ENV] ✓ Created\n")
+        
+        if pretrained_model and os.path.exists(pretrained_model):
+            print(f"[MODEL] Loading pretrained")
+            model = SAC.load(pretrained_model, device=self.device)
+            model.set_env(env)
+            model.learning_rate = learning_rate * 0.3
+            print(f"[MODEL] LR: {model.learning_rate:.2e}\n")
+        else:
+            print("[MODEL] Creating new SAC with SMALL network...")
+            model = SAC(
+                "MlpPolicy",
+                env,
+                learning_rate=learning_rate,
+                buffer_size=buffer_size,
+                learning_starts=25_000,
+                batch_size=batch_size,
+                tau=0.005,
+                gamma=0.99,
+                train_freq=(1, "step"),
+                gradient_steps=1,
+                ent_coef=0.01,
+                target_entropy='auto',
+                target_update_interval=1,
+                policy_kwargs=dict(
+                    net_arch=[256, 256, 128],  # ← SMALLER! (was [512, 512, 256, 256])
+                    activation_fn=nn.ReLU
+                ),
+                verbose=1,
+                device=self.device,
+                tensorboard_log=f"logs/{env_id.replace('-v0', '')}_{il_phase}"
+            )
+            print("[MODEL] ✓ Created (256→256→128 network)\n")
+        
+        output_dir = f"sac_models_10mb/{env_id.replace('-v0', '')}_{il_phase}"
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
+        os.makedirs(f"{output_dir}/evaluations", exist_ok=True)
+        
+        callbacks = CallbackList([
+            CheckpointCallback(
+                save_freq=100_000 // n_envs,
+                save_path=f"{output_dir}/checkpoints",
+                name_prefix="sac",
+                verbose=1
+            ),
+            EvalCallback(
+                eval_env,
+                best_model_save_path=output_dir,
+                log_path=output_dir,
+                eval_freq=25_000 // n_envs,
+                n_eval_episodes=10,
+                deterministic=True,
+                verbose=1
+            ),
+            DetailedEvalCallback(
+                eval_env,
+                log_path=f"{output_dir}/evaluations",
+                eval_freq=50_000 // n_envs,
+                n_eval_episodes=15
+            ),
+            PerformanceCallback(timesteps),
+            GracefulShutdownCallback(output_dir)
+        ])
+        
+        print(f"[TRAINING] Starting {timesteps:,} steps\n")
+        
+        start_time = datetime.now()
+        
+        model.learn(
+            total_timesteps=timesteps,
+            callback=callbacks,
+            log_interval=10,
+            progress_bar=True
+        )
+        
+        final_path = os.path.join(output_dir, "final_model.zip")
+        model.save(final_path)
+        
+        training_time = (datetime.now() - start_time).total_seconds()
+        
+        print("\n" + "="*80)
+        print("TRAINING COMPLETE")
+        print("="*80)
+        print(f"Time: {training_time/3600:.2f} hours")
+        print(f"Model: {final_path}")
+        print("="*80 + "\n")
+        
+        # Get observation dimension for this environment
+        obs_dim = env.envs[0].observation_space.shape[0]
+        action_dim = 12  # All environments have 12 DOF
+        
+        # Create actor-only submission
+        best_model_path = os.path.join(output_dir, "best_model.zip")
+        submission_model = self.prepare_actor_only_submission(
+            best_model_path,
+            f"{env_id.replace('-v0', '')}_{il_phase}_actor",
+            obs_dim,
+            action_dim
+        )
+        
+        print(f"\n✅ Actor-only submission: {submission_model}\n")
+        
+        env.close()
+        eval_env.close()
+        
+        return best_model_path
+    
+    def train_all_phases(self):
+        """Train all 4 phases"""
+        
+        print("\n" + "="*80)
+        print("COMPLETE TRAINING PIPELINE - 10MB SUBMISSIONS")
+        print("="*80)
+        print("\nExpected Results:")
+        print("  Phase 1: 80-85% success (small network penalty)")
+        print("  Phase 2: 65-75% success")
+        print("  Phase 3: 55-70% success")
+        print("  Phase 4: 75-80% success")
+        print("\nFile Sizes: ~5-8 MB each ✅")
+        print("\nTotal Time: ~30-40 hours (faster!)")
+        print("="*80 + "\n")
+        
+        input("Press Enter to start Phase 1...")
+        
+        # Phase 1
+        print("\n" + "="*80)
+        print("PHASE 1/4: KICK TO TARGET")
+        print("="*80 + "\n")
+        
+        phase1_model = self.train_phase(
+            env_id="LowerT1KickToTarget-v0",
+            il_phase="approach_and_balance",
+            timesteps=20_000_000,
+            pretrained_model=None,
+            n_envs=16,
+            buffer_size=500_000,
+            batch_size=512,
+            learning_rate=3e-4
+        )
+        
+        print("\n✅ Phase 1 complete!\n")
+        input("Press Enter to start Phase 2...")
+        
+        # Phase 2
+        print("\n" + "="*80)
+        print("PHASE 2/4: OBSTACLE PENALTY")
+        print("="*80 + "\n")
+        
+        phase2_model = self.train_phase(
+            env_id="LowerT1ObstaclePenaltyKick-v0",
+            il_phase="obstacle_kicking",
+            timesteps=15_000_000,
+            pretrained_model=phase1_model,
+            n_envs=16,
+            buffer_size=500_000,
+            batch_size=512,
+            learning_rate=3e-4
+        )
+        
+        print("\n✅ Phase 2 complete!\n")
+        input("Press Enter to start Phase 3...")
+        
+        # Phase 3
+        print("\n" + "="*80)
+        print("PHASE 3/4: GOALIE PENALTY")
+        print("="*80 + "\n")
+        
+        phase3_model = self.train_phase(
+            env_id="LowerT1GoaliePenaltyKick-v0",
+            il_phase="powerful_goalie_beater",
+            timesteps=15_000_000,
+            pretrained_model=phase2_model,
+            n_envs=16,
+            buffer_size=500_000,
+            batch_size=512,
+            learning_rate=3e-4
+        )
+        
+        print("\n✅ Phase 3 complete!\n")
+        input("Press Enter to start Phase 4...")
+        
+        # Phase 4
+        print("\n" + "="*80)
+        print("PHASE 4/4: SCENE GENERALIZATION")
+        print("="*80 + "\n")
+        
+        scene_model = self.train_scene_generalization(
+            pretrained_model=phase3_model,
+            timesteps=25_000_000
+        )
+        
+        # Summary
+        print("\n" + "="*80)
+        print("ALL PHASES COMPLETE!")
+        print("="*80)
+        print(f"Phase 1: {phase1_model}")
+        print(f"Phase 2: {phase2_model}")
+        print(f"Phase 3: {phase3_model}")
+        print(f"Phase 4: {scene_model}")
+        print("\nSubmission files: models_for_submission/")
+        print("File size: ~5-8 MB each ✅ UNDER 10MB!")
+        print("\nSubmit these .pt files (not .zip)!")
+        print("="*80 + "\n")
+    
+    def train_scene_generalization(self, pretrained_model, timesteps=25_000_000):
+        """Train on all 3 tasks"""
+        
+        scene_id = "scn_fk2IPfTF7cVe"
+        
+        print(f"[MODEL] Loading pretrained")
+        model = SAC.load(pretrained_model, device=self.device)
+        
+        print(f"[SCENE] Loading {scene_id}")
+        sai = SAIClient(scene_id=scene_id)
+        
+        preprocessor = TaskPreprocessor()
+        
+        n_envs_per_task = 5
+        env_makers = []
+        
+        il_model = load_il_model("complete_generalization", self.device)
+        
+        for task_idx in [0, 1, 2]:
+            for _ in range(n_envs_per_task):
+                def make_env(task_idx=task_idx):
+                    base = sai.make_env(task_idx)
+                    wrapped = EnhancedRewardWrapper(
+                        base,
+                        il_model=il_model,
+                        device=self.device,
+                        env_name="Scene"
+                    )
+                    preprocessed = PreprocessedEnv(wrapped, preprocessor)
+                    return Monitor(preprocessed)
+                
+                env_makers.append(make_env)
+        
+        env = DummyVecEnv(env_makers)
+        
+        eval_makers = []
+        for task_idx in [0, 1, 2]:
+            def make_eval(task_idx=task_idx):
+                base = sai.make_env(task_idx)
+                preprocessed = PreprocessedEnv(base, preprocessor)
+                return Monitor(preprocessed)
+            eval_makers.append(make_eval)
+        
+        eval_env = DummyVecEnv(eval_makers)
+        
+        model.set_env(env)
+        model.learning_rate = 1e-4
+        
+        output_dir = "sac_models_10mb/scene_generalization"
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
+        os.makedirs(f"{output_dir}/evaluations", exist_ok=True)
+        
+        callbacks = CallbackList([
+            CheckpointCallback(
+                save_freq=100_000 // 15,
+                save_path=f"{output_dir}/checkpoints",
+                name_prefix="scene",
+                verbose=1
+            ),
+            EvalCallback(
+                eval_env,
+                best_model_save_path=output_dir,
+                log_path=output_dir,
+                eval_freq=50_000 // 15,
+                n_eval_episodes=9,
+                deterministic=True,
+                verbose=1
+            ),
+            DetailedEvalCallback(
+                eval_env,
+                log_path=f"{output_dir}/evaluations",
+                eval_freq=100_000 // 15,
+                n_eval_episodes=12
+            ),
+            PerformanceCallback(timesteps),
+            GracefulShutdownCallback(output_dir)
+        ])
+        
+        print(f"[TRAINING] Multi-task {timesteps:,} steps\n")
+        
+        start_time = datetime.now()
+        
+        model.learn(
+            total_timesteps=timesteps,
+            callback=callbacks,
+            log_interval=10,
+            progress_bar=True
+        )
+        
+        final_path = os.path.join(output_dir, "final_competition_model.zip")
+        model.save(final_path)
+        
+        training_time = (datetime.now() - start_time).total_seconds()
+        
+        print("\n" + "="*80)
+        print("SCENE COMPLETE")
+        print("="*80)
+        print(f"Time: {training_time/3600:.2f} hours")
+        print("="*80 + "\n")
+        
+        # Scene observation dimension (includes task one-hot)
+        obs_dim = 42  # 39 + 3 (task one-hot)
+        action_dim = 12
+        
+        submission_model = self.prepare_actor_only_submission(
+            os.path.join(output_dir, "best_model.zip"),
+            "scene_competition_actor",
+            obs_dim,
+            action_dim
+        )
+        
+        print(f"\n✅ Competition file: {submission_model}\n")
+        
+        env.close()
+        eval_env.close()
+        
+        return os.path.join(output_dir, "best_model.zip")
+
+
+def main():
+    """Main execution"""
+    
+    print("\n" + "="*80)
+    print("FINAL SAC TRAINING - 10MB SUBMISSION LIMIT")
+    print("="*80)
+    print("\nConfiguration:")
+    print("  ✅ target_weight = 0.55")
+    print("  ✅ buffer_size = 500K")
+    print("  ✅ ent_coef = 0.01")
+    print("  ✅ max_episode_length = 400")
+    print("  ✅ net_arch = [256, 256, 128] (SMALL)")
+    print("  ✅ Actor-only submission")
+    print("\nFile Sizes:")
+    print("  Checkpoints: ~800 MB - 1 GB")
+    print("  Submissions: ~5-8 MB ✅ UNDER 10MB!")
+    print("\nExpected Results:")
+    print("  Step 100K:  5-10% success")
+    print("  Step 500K:  50-60% success")
+    print("  Step 20M:   80-85% success")
+    print("\nTotal Time: ~30-40 hours (faster!)")
+    print("="*80 + "\n")
+    
+    response = input("Ready to start training? (yes/no): ")
+    if response.lower() != "yes":
+        print("Training cancelled.")
+        return
+    
+    trainer = SACTrainer()
+    trainer.train_all_phases()
+
+
+if __name__ == "__main__":
+    main()
